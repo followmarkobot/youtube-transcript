@@ -35,14 +35,51 @@ async function fetchVideoMeta(videoId: string) {
   }
 }
 
-interface InnertubeTranscriptSegment {
-  utf8: string;
-  tOffsetMs: string;
-  dDurationMs: string;
+interface CaptionTrack {
+  languageCode: string;
+  baseUrl: string;
+  name?: { simpleText?: string };
 }
 
-async function fetchTranscriptInnertube(videoId: string) {
-  // Step 1: Get the page to extract API key and continuation token
+interface TranscriptEvent {
+  tStartMs: number;
+  segs?: { utf8: string }[];
+}
+
+// Strategy 1: iOS Innertube client (best success rate from servers)
+async function fetchViaIOS(videoId: string): Promise<CaptionTrack[] | null> {
+  const res = await fetch(
+    "https://www.youtube.com/youtubei/v1/player?key=AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc&prettyPrint=false",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent":
+          "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 15_6 like Mac OS X)",
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: "IOS",
+            clientVersion: "19.09.3",
+            deviceModel: "iPhone14,3",
+            hl: "en",
+            gl: "US",
+          },
+        },
+        videoId,
+      }),
+    }
+  );
+  const data = await res.json();
+  if (data.playabilityStatus?.status !== "OK") return null;
+  return (
+    data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || null
+  );
+}
+
+// Strategy 2: WEB client via page scrape
+async function fetchViaWebPage(videoId: string): Promise<CaptionTrack[] | null> {
   const pageRes = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
     headers: {
       "User-Agent":
@@ -52,47 +89,28 @@ async function fetchTranscriptInnertube(videoId: string) {
   });
   const html = await pageRes.text();
 
-  // Extract API key
-  const apiKeyMatch = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-  const apiKey = apiKeyMatch?.[1] || "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-
-  // Try to get captions from initial player response
   const playerMatch = html.match(
-    new RegExp("ytInitialPlayerResponse\\s*=\\s*(\\{.+?\\})\\s*;\\s*(?:var\\s|<\\/script>)", "s")
+    new RegExp(
+      "ytInitialPlayerResponse\\s*=\\s*(\\{.+?\\})\\s*;\\s*(?:var\\s|<\\/script>)",
+      "s"
+    )
   );
-  if (playerMatch) {
-    try {
-      const player = JSON.parse(playerMatch[1]);
-      const captionTracks =
-        player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-      if (captionTracks && captionTracks.length > 0) {
-        // Prefer English, fall back to first track
-        const track =
-          captionTracks.find(
-            (t: { languageCode: string }) => t.languageCode === "en"
-          ) || captionTracks[0];
-        const trackUrl = track.baseUrl + "&fmt=json3";
-        const trackRes = await fetch(trackUrl);
-        const trackData = await trackRes.json();
-        if (trackData.events) {
-          return trackData.events
-            .filter((e: { segs?: unknown[] }) => e.segs)
-            .map((e: { tStartMs: number; segs: { utf8: string }[] }) => ({
-              time: e.tStartMs / 1000,
-              text: e.segs.map((s: { utf8: string }) => s.utf8).join(""),
-            }))
-            .filter((e: { text: string }) => e.text.trim());
-        }
-      }
-    } catch {
-      // Fall through to Innertube API
-    }
-  }
+  if (!playerMatch) return null;
 
-  // Step 2: Use Innertube API to get transcript
-  // First get video info to find transcript panel
-  const playerApiRes = await fetch(
-    `https://www.youtube.com/youtubei/v1/player?key=${apiKey}`,
+  try {
+    const player = JSON.parse(playerMatch[1]);
+    return (
+      player?.captions?.playerCaptionsTracklistRenderer?.captionTracks || null
+    );
+  } catch {
+    return null;
+  }
+}
+
+// Strategy 3: WEB Innertube API
+async function fetchViaWebAPI(videoId: string): Promise<CaptionTrack[] | null> {
+  const res = await fetch(
+    "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -109,33 +127,48 @@ async function fetchTranscriptInnertube(videoId: string) {
       }),
     }
   );
-  const playerData = await playerApiRes.json();
+  const data = await res.json();
+  if (data.playabilityStatus?.status !== "OK") return null;
+  return (
+    data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || null
+  );
+}
 
-  const captionTracks =
-    playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!captionTracks || captionTracks.length === 0) {
-    throw new Error("NO_TRANSCRIPT");
-  }
-
+async function downloadTranscript(tracks: CaptionTrack[]) {
+  // Prefer English, fall back to first
   const track =
-    captionTracks.find(
-      (t: { languageCode: string }) => t.languageCode === "en"
-    ) || captionTracks[0];
+    tracks.find((t) => t.languageCode === "en") || tracks[0];
   const trackUrl = track.baseUrl + "&fmt=json3";
-  const trackRes = await fetch(trackUrl);
-  const trackData = await trackRes.json();
+  const res = await fetch(trackUrl);
+  const data = await res.json();
 
-  if (!trackData.events) {
-    throw new Error("NO_TRANSCRIPT");
-  }
+  if (!data.events) throw new Error("NO_TRANSCRIPT");
 
-  return trackData.events
-    .filter((e: { segs?: InnertubeTranscriptSegment[] }) => e.segs)
-    .map((e: { tStartMs: number; segs: InnertubeTranscriptSegment[] }) => ({
+  return data.events
+    .filter((e: TranscriptEvent) => e.segs)
+    .map((e: TranscriptEvent) => ({
       time: e.tStartMs / 1000,
-      text: e.segs.map((s) => s.utf8).join(""),
+      text: e.segs!.map((s) => s.utf8).join(""),
     }))
     .filter((e: { text: string }) => e.text.trim());
+}
+
+async function fetchTranscript(videoId: string) {
+  // Try strategies in order of reliability
+  const strategies = [fetchViaIOS, fetchViaWebPage, fetchViaWebAPI];
+
+  for (const strategy of strategies) {
+    try {
+      const tracks = await strategy(videoId);
+      if (tracks && tracks.length > 0) {
+        return await downloadTranscript(tracks);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  throw new Error("NO_TRANSCRIPT");
 }
 
 export async function POST(req: NextRequest) {
@@ -153,7 +186,7 @@ export async function POST(req: NextRequest) {
 
     const [meta, transcript] = await Promise.all([
       fetchVideoMeta(videoId),
-      fetchTranscriptInnertube(videoId),
+      fetchTranscript(videoId),
     ]);
 
     return NextResponse.json({
@@ -169,7 +202,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           error:
-            "No transcript available for this video. It may not have captions enabled.",
+            "No transcript available for this video. It may not have captions enabled, or YouTube may be blocking server access.",
         },
         { status: 422 }
       );
